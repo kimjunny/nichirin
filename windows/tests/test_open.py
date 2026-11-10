@@ -765,5 +765,91 @@ class ScalingTests(unittest.TestCase):
         self.assertEqual(row_geometry(0), row_geometry(96))
 
 
+FRIEND_RESULTS = 902
+
+
+class FriendDesktop(FakeDesktop):
+    """A desktop whose friends search lists the friends whose name holds the text."""
+
+    def __init__(self, rows: list[str], friends: list[str]) -> None:
+        super().__init__(rows)
+        self.friends = friends
+        self.filters = True
+        self.friend_rows: list[str] = []
+        self.friend_searches: list[str] = []
+        self.friend_clears = 0
+
+    def search_contacts(self, text: str) -> int | None:
+        if not self.filters:
+            return None
+        self.friend_searches.append(text)
+        self.friend_rows = [name for name in self.friends if text in name]
+        return FRIEND_RESULTS
+
+    def clear_contact_search(self) -> None:
+        self.friend_clears += 1
+        self.friend_rows = []
+
+    def scroll_to_top(self, control: int) -> None:
+        if control != FRIEND_RESULTS:
+            super().scroll_to_top(control)
+
+    def click_row(self, control: int, row: int) -> None:
+        if control != FRIEND_RESULTS:
+            super().click_row(control, row)
+            return
+        self.log.append(f"friends:{row}")
+        if row < len(self.friend_rows):
+            self.windows.append(ChatWindow(handle=400 + row, title=self.friend_rows[row]))
+
+
+class FriendRowTests(unittest.TestCase):
+    """A 1:1 room opens from its friend's row, found by the friend's name."""
+
+    def desktop(self) -> FriendDesktop:
+        # The chat search would list a group with the person in it first.
+        desktop = FriendDesktop(["남의 방", "합성 교수님"], ["합성 교수님", "합성 친구"])
+        desktop.searchable = True
+        desktop.listings = {"합성 교수님": ["남의 방", "합성 교수님"]}
+        return desktop
+
+    def test_a_direct_room_opens_from_its_friend_without_a_chat_search(self) -> None:
+        desktop = self.desktop()
+        window = opener(desktop).open("합성 교수님", hint=1, contact_name="합성 교수님")
+        self.assertEqual(window.title, "합성 교수님")
+        self.assertEqual(desktop.friend_searches, ["합성 교수님"])
+        self.assertEqual(desktop.searches, [])
+        self.assertEqual(desktop.clicks, [])
+        self.assertEqual(desktop.friend_clears, 1)
+        self.assertEqual(desktop.minimized, [window.handle])
+
+    def test_a_friends_search_that_cannot_filter_clicks_no_friend(self) -> None:
+        desktop = self.desktop()
+        desktop.filters = False
+        with self.assertRaises(KanaoError):
+            opener(desktop).open("합성 교수님", hint=1, contact_name="합성 교수님")
+        self.assertNotIn("friends:0", desktop.log)
+        self.assertEqual(desktop.searches, ["합성 교수님"])
+
+    def test_a_wrong_friend_is_closed_and_the_chat_search_follows(self) -> None:
+        desktop = self.desktop()
+        desktop.friends = ["합성 친구"]
+        desktop.listings = {"합성 교수님": ["합성 교수님"]}
+        window = opener(desktop).open("합성 교수님", hint=1, contact_name="합성")
+        self.assertEqual(window.title, "합성 교수님")
+        self.assertEqual(desktop.closed, ["합성 친구"])
+        self.assertEqual(desktop.searches, ["합성 교수님"])
+
+    def test_a_miss_everywhere_guesses_no_row(self) -> None:
+        desktop = self.desktop()
+        desktop.friends = []
+        desktop.listings = {}
+        with self.assertRaises(KanaoError) as caught:
+            opener(desktop).open("합성 교수님", hint=1, contact_name="합성 교수님")
+        self.assertEqual(caught.exception.code, ErrorCode.WINDOW_NOT_FOUND)
+        self.assertEqual(desktop.friend_searches, ["합성 교수님"])
+        self.assertEqual(desktop.clicks, [0], "rows were guessed after the search had run")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping, Optional, Protocol, TypedDict, cast
+from typing import Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence, TypedDict, cast
 
 from .errors import ErrorCode, KanaoError
 import kakaocommon.trace as trace
@@ -42,6 +42,7 @@ ROOM_LIST_PREFIX = "ChatRoomListCtrl"
 CONTACT_LIST_PREFIX = "ContactListCtrl"
 SEARCH_LIST_PREFIX = "SearchListCtrl"
 LIST_VIEW_PREFIX = "ChatRoomListView"
+CONTACT_VIEW_PREFIX = "ContactListView"
 TAB_BAR_PREFIX = "OnlineMainView"
 CHAT_TAB_Y = 59
 """The chat icon's centre on the main view's left bar, from its top at 96 DPI.
@@ -61,7 +62,13 @@ ROW_X = 134
 MEASURED_DPI = 96
 """The scaling the geometry above was measured at."""
 SEARCHED_ROWS = 8
-"""How far down the list a room is looked for before giving up."""
+"""How many rows of the unsorted room list a *guessed* row may span.
+
+This bounds the sweep in :meth:`RoomOpener._order`, not the client search:
+with a hint only the hinted row and the remembered one are tried, so an
+exhaustive "first N rooms" is never attempted when a hint exists. Messages
+built from this number must say what was actually tried.
+"""
 POLL_SECONDS = 0.05
 """How often to look for the window a posted double-click produces."""
 SEARCH_SETTLE_SECONDS = 0.1
@@ -267,6 +274,22 @@ class RoomListBackend(Protocol):
         """Empty the search box again, so the list goes back to recency order."""
         ...
 
+    def search_contacts(self, text: str) -> Optional[int]:
+        """Narrow the friends list to *text* through the friends tab's own box.
+
+        Returns the list the results are drawn in. The main window also holds
+        a search box and result list for chats; those filter conversations,
+        not friends, so this is scoped to the friends tab.
+        A box the client never laid out filters nothing and a list too short
+        to hold a row is a placeholder, so either is reported as None and the
+        caller keeps to the paths that work today.
+        """
+        ...
+
+    def clear_contact_search(self) -> None:
+        """Empty the friends search box, so its list goes back to its own order."""
+        ...
+
 
 class WindowBackend(Protocol):
     """Everything the sender needs from the windowing system."""
@@ -327,6 +350,38 @@ def _learn_row(path: Path, room: str, row: int) -> None:
         path.write_text(json.dumps(stored), encoding="utf-8")
     except OSError:
         pass
+
+
+def open_failure_note(
+    room: str,
+    *,
+    searched_terms: Sequence[str] = (),
+    guessed_rows: Sequence[int] = (),
+    contact_name: Optional[str] = None,
+) -> str:
+    """Say what was actually tried, for a room nothing opened.
+
+    The old message claimed the room "was not among the first 8 rooms"
+    whatever had happened, and that was false in the common case: with a
+    hint only one or two rows are guessed at, and when the client search ran
+    no row is guessed at all. A person reading it would go looking for a
+    room in a place that was never searched. This names the attempts that
+    were made, in the order they were made, and only the ones that were.
+    """
+    tried: list[str] = []
+    if contact_name is not None:
+        tried.append(f"the friends list filtered by {contact_name!r}")
+    for term in searched_terms:
+        tried.append(f"the client search for {term!r}")
+    for row in guessed_rows:
+        tried.append(f"row {row + 1} of the room list")
+    if not tried:
+        tried.append("nothing: no friends row, search box or room list was usable")
+    return (
+        f"{room!r} was not opened; tried "
+        + ", ".join(tried)
+        + ". Open it once by hand, then it is remembered."
+    )
 
 
 class RoomOpener:
@@ -455,6 +510,34 @@ class RoomOpener:
         if not is_minimized(handle) or self._holds_keyboard(handle):
             self._backend.minimize_window(handle)
 
+    def _from_contact(
+        self, name: str, wanted: set[str], known: set[str]
+    ) -> tuple[Optional[ChatWindow], bool]:
+        """Open a 1:1 room from the person in the friends list.
+
+        Double-clicking a friend opens that friend's room itself, so unlike a
+        chat-list row - which holds whatever that list shows at that height -
+        or a chat search result - which may be a group that merely has them as
+        a member - it cannot open somebody else's conversation. The friends
+        tab filters its own list through its own search box, and what opens is
+        still verified by title, so a stale result costs one closed window.
+        """
+        search = getattr(self._backend, "search_contacts", None)
+        clear = getattr(self._backend, "clear_contact_search", None)
+        if search is None or clear is None:
+            return None, False
+        try:
+            results = search(name)
+            if results is None:
+                # The friends tab was never shown, so its box filters nothing:
+                # clicking a row now would open an unfiltered stranger.
+                return None, False
+            # Scrolled first: a list left part-way down would put some other
+            # friend's row at the top, and opening one marks it read.
+            return self._try_row(results, 0, wanted, known), True
+        finally:
+            clear()
+
     def _from_own_profile(self, wanted: set[str], known: set[str]) -> Optional[ChatWindow]:
         """Open the self-chat from the account's own row atop the friends list.
 
@@ -494,7 +577,7 @@ class RoomOpener:
         wanted: set[str],
         known: set[str],
         rows: Optional[Mapping[str, Optional[int]]] = None,
-    ) -> tuple[bool, Optional[ChatWindow]]:
+    ) -> tuple[bool, Optional[ChatWindow], list[str]]:
         """Type each title into the client's search box and open one row.
 
         The filtered list still names nothing, so the row is verified exactly
@@ -503,14 +586,17 @@ class RoomOpener:
         *rows* is where the caller predicts each title lists the room; a
         title predicted to list it nowhere is not typed, and without
         predictions every title is tried at the top.
-        Returns whether a row was opened at all, beside what it opened: a
-        search that ran and missed must not be followed by guessing rows,
-        each of which is another stranger's window on the screen.
+        Returns whether a row was opened at all, beside what it opened and
+        which terms were really searched. A search that ran and missed is
+        not followed by any row guess - each one is another stranger's
+        window on the screen - and the failure message names exactly what
+        was tried.
         """
         search = getattr(self._backend, "search_rooms", None)
         if search is None:
-            return False, None
+            return False, None, []
         searched = False
+        terms: list[str] = []
         try:
             # The catalog title first, then the window's own: the self-chat
             # is listed and searched under the account's name, so searching
@@ -522,12 +608,13 @@ class RoomOpener:
                     continue
                 results = search(term)
                 if results is None:
-                    return searched, None
+                    return searched, None, terms
                 searched = True
+                terms.append(term)
                 found = self._try_row(results, row, wanted, known, scroll=False)
                 if found is not None:
-                    return True, found
-            return searched, None
+                    return True, found, terms
+            return searched, None, terms
         finally:
             clear = getattr(self._backend, "clear_search", None)
             if clear is not None:
@@ -540,6 +627,7 @@ class RoomOpener:
         hint: Optional[int] = None,
         search_rows: Optional[Mapping[str, Optional[int]]] = None,
         self_chat: bool = False,
+        contact_name: Optional[str] = None,
     ) -> ChatWindow:
         """Open *room*, accepting any of *aliases* as its window title.
 
@@ -552,7 +640,7 @@ class RoomOpener:
         foreground = getattr(self._backend, "foreground", None)
         had_focus = foreground() if foreground is not None else None
         try:
-            return self._open(room, aliases, hint, search_rows, self_chat)
+            return self._open(room, aliases, hint, search_rows, self_chat, contact_name)
         finally:
             # Whatever opened took the keyboard with it: the client activates
             # a room's window as it shows it, and the person was typing
@@ -567,6 +655,7 @@ class RoomOpener:
         hint: Optional[int],
         search_rows: Optional[Mapping[str, Optional[int]]] = None,
         self_chat: bool = False,
+        contact_name: Optional[str] = None,
     ) -> ChatWindow:
         wanted = {room, *aliases}
         control = self._backend.room_list()
@@ -594,6 +683,18 @@ class RoomOpener:
         # The search lists members' rooms too, so the room asked for is not
         # always the first result; the caller predicts which row it is.
         found = self._from_own_profile(wanted, known) if self_chat else None
+        # A 1:1 room is opened from its friend's row before anything is
+        # searched for: that row names the person the room is with, so it
+        # cannot land on a group that merely has them as a member, and it
+        # needs no prediction of where a recency-ordered list puts the room.
+        # It needs no chat tab either, so it comes before that check.
+        contact_tried = False
+        if found is None and contact_name is not None:
+            found, contact_tried = self._from_contact(contact_name, wanted, known)
+            if found is not None:
+                if disturbed is not None:
+                    self._backend.restore_main_window(disturbed)
+                return found
         # The room list exists, hidden, while another tab is in front, and a
         # freshly started client opens on its friends tab. Its search box is
         # hidden with it: typing there never brings a result list, and a
@@ -611,10 +712,18 @@ class RoomOpener:
                 "forward, so its room list cannot be searched or clicked; show the "
                 "chat tab once and try again",
             )
+        searched_terms: list[str] = []
+        guessed_rows: list[int] = []
         if found is None:
-            searched, found = self._search(room, wanted, known, search_rows)
+            searched, found, searched_terms = self._search(room, wanted, known, search_rows)
+            # A search that ran and missed is not followed by guessing. The
+            # room list can be narrowed by the client's own filter (안읽음 and
+            # the like), which the catalog cannot see: under one, the hinted
+            # row was somebody else's room, opened and marked read for
+            # nothing. Rows are guessed only where no search could run.
             if not searched:
                 for row in self._order(room, hint):
+                    guessed_rows.append(row)
                     found = self._try_row(control, row, wanted, known)
                     if found is not None:
                         _learn_row(self._remembered, room, row)
@@ -627,8 +736,12 @@ class RoomOpener:
             self._backend.restore_main_window(disturbed)
         raise KanaoError(
             ErrorCode.WINDOW_NOT_FOUND,
-            f"{room!r} was not among the first {self._rows} rooms in the list "
-            "and the client's search did not find it; open it once by hand",
+            open_failure_note(
+                room,
+                searched_terms=searched_terms,
+                guessed_rows=guessed_rows,
+                contact_name=contact_name if contact_tried else None,
+            ),
         )
 
 
@@ -735,6 +848,7 @@ class Sender:
         hint: Optional[int] = None,
         search_rows: Optional[Mapping[str, Optional[int]]] = None,
         self_chat: bool = False,
+        contact_name: Optional[str] = None,
     ) -> ChatWindow:
         """Find the one open chat window for *room*, refusing to guess.
 
@@ -754,7 +868,9 @@ class Sender:
 
         if not matches:
             if open_if_needed and self._opener is not None:
-                return self._opener.open(room, aliases, hint, search_rows, self_chat)
+                return self._opener.open(
+                    room, aliases, hint, search_rows, self_chat, contact_name
+                )
             raise KanaoError(
                 ErrorCode.WINDOW_NOT_FOUND,
                 f"No open chat window matches {room!r}; open that conversation in "
@@ -806,6 +922,7 @@ class Sender:
         search_rows: Optional[Mapping[str, Optional[int]]] = None,
         self_chat: bool = False,
         before_input: Optional[Callable[[], None]] = None,
+        contact_name: Optional[str] = None,
     ) -> SendResult:
         """Type *text* into *room*'s window and send it, or preview when dry.
 
@@ -829,6 +946,7 @@ class Sender:
                     hint=hint,
                     search_rows=search_rows,
                     self_chat=self_chat,
+                    contact_name=contact_name,
                 )
                 trace.identify("window", window.handle)
                 trace.observed("D")
@@ -899,6 +1017,7 @@ class Sender:
         hint: Optional[int] = None,
         search_rows: Optional[Mapping[str, Optional[int]]] = None,
         self_chat: bool = False,
+        contact_name: Optional[str] = None,
     ) -> UploadResult:
         """Send the file at *path* to *room* the way a person would.
 
@@ -935,6 +1054,7 @@ class Sender:
                 hint=hint,
                 search_rows=search_rows,
                 self_chat=self_chat,
+                contact_name=contact_name,
             )
             previous = backend.foreground()
             parked = backend.show_unfocused(window.handle)
@@ -1087,6 +1207,7 @@ _SW_HIDE = 0
 _SW_MINIMIZE = 6
 _SW_SHOWMINNOACTIVE = 7
 _SW_SHOWNOACTIVATE = 4
+_SW_SHOWNA = 8
 _HWND_BOTTOM = 1
 _SWP_NOSIZE = 0x0001
 _SWP_NOMOVE = 0x0002
@@ -1149,6 +1270,7 @@ class Win32Backend:
         except AttributeError:
             pass
         self._pause: Callable[[float], None] = time.sleep
+        self._shown_contact_view: Optional[int] = None
 
     def _message(self, control: int, code: int, wp: int = 0, lp: int = 0) -> int:
         """Bound synchronous cross-process messages to two seconds."""
@@ -1420,6 +1542,146 @@ class Win32Backend:
                 return True
             time.sleep(POLL_SECONDS)
         return False
+
+    def _client_size(self, handle: int) -> tuple[int, int]:
+        """The control's own width and height, which say whether it is laid out.
+
+        A control that was never shown can exist at 0x0 or at a placeholder
+        size, and one typed into at that size filters nothing: the client
+        lays the search row out when its tab is first shown.
+        """
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        with self._as_window(handle):
+            found = self._user32.GetClientRect(handle, ctypes.byref(rect))
+        if not found:
+            return 0, 0
+        return max(0, rect.right - rect.left), max(0, rect.bottom - rect.top)
+
+    def _contact_view(self) -> Optional[int]:
+        """The friends tab's own view, shown or not.
+
+        The main window holds one view per tab; this one is hidden but built
+        while the chat tab is in front, which is what lets a row in it be
+        clicked without bringing the tab forward.
+        """
+        main = self._main_window()
+        if main is None:
+            return None
+        found: list[int] = []
+
+        def visit(handle: int, _param: int) -> bool:
+            if self._title(handle).startswith(CONTACT_VIEW_PREFIX):
+                found.append(int(handle))
+                return False
+            return True
+
+        self._user32.EnumChildWindows(main, self._proc(visit), 0)
+        return found[0] if found else None
+
+    def _contact_search_box(self) -> Optional[int]:
+        """The friends tab's search field, laid out or not.
+
+        While the friends search has never been opened it exists at 0x0, and
+        that is the usual state: requiring a sized box skipped the friends
+        list in every such session, which is how a 1:1 room titled
+        '김혜린 교수님' for the friend '김혜린' fell through to guesses. What
+        decides whether the text filtered is the friends view being shown
+        while it is typed, which :meth:`search_contacts` sees to; a 0x0 box
+        in a shown view filtered and opened the friend's room, measured live.
+        """
+        view = self._contact_view()
+        if view is None:
+            return None
+        found: list[int] = []
+
+        def visit(handle: int, _param: int) -> bool:
+            if self._class(handle) == "Edit":
+                found.append(int(handle))
+                return False
+            return True
+
+        self._user32.EnumChildWindows(view, self._proc(visit), 0)
+        return found[0] if found else None
+
+    def _contact_results(self) -> Optional[int]:
+        """The friends result list, scoped to the friends tab and laid out.
+
+        The main window holds a second ``SearchListCtrl`` for chats, and the
+        friends pane is hidden while the chat tab is in front, so a visible-
+        only lookup finds nothing here and one scoped only by name finds the
+        chat list's. Being a child of the friends view tells them apart
+        whatever tab the person has in front.
+
+        A result list shorter than one row is the placeholder this was
+        measured at (25x25) before the friends tab was ever shown; clicking
+        its first row would open whatever the unfiltered list has there.
+        One that is not shown is not the filtered one either: typed into
+        while the friends view was hidden, its first row opened the account's
+        own chat, the unfiltered list's top. The client shows it once it has
+        filtered, as the chat side's does.
+        """
+        view = self._contact_view()
+        if view is None:
+            return None
+        found: list[int] = []
+
+        def visit(handle: int, _param: int) -> bool:
+            if self._title(handle).startswith(SEARCH_LIST_PREFIX):
+                found.append(int(handle))
+                return False
+            return True
+
+        self._user32.EnumChildWindows(view, self._proc(visit), 0)
+        if not found:
+            return None
+        if not self._user32.IsWindowVisible(found[0]):
+            return None
+        pitch, _first, _column = row_geometry(self._dpi(found[0]))
+        _width, height = self._client_size(found[0])
+        return found[0] if height >= pitch else None
+
+    def search_contacts(self, text: str) -> Optional[int]:
+        """Filter the friends list by *text* with its view shown, not its tab.
+
+        The friends view only filters while it is shown: typed into hidden,
+        its result list kept the unfiltered order. Clicking the tab would
+        change what the person sees and needs the window active, so the view
+        alone is shown without activation for the search and hidden again by
+        :meth:`clear_contact_search`; the tab the person had in front stays
+        theirs. No cursor is moved and no window is activated.
+        """
+        box = self._contact_search_box()
+        view = self._contact_view()
+        if box is None or view is None:
+            return None
+        if not self._user32.IsWindowVisible(view):
+            self._user32.ShowWindow(view, _SW_SHOWNA)
+            self._shown_contact_view = view
+        try:
+            self._replace(box, text)
+        except OSError:
+            return None
+        for _attempt in range(POLL_ATTEMPTS):
+            results = self._contact_results()
+            if results is not None:
+                time.sleep(SEARCH_SETTLE_SECONDS)
+                return results
+            time.sleep(POLL_SECONDS)
+        return None
+
+    def clear_contact_search(self) -> None:
+        box = self._contact_search_box()
+        try:
+            if box is not None:
+                self._replace(box, "")
+        except OSError:
+            pass
+        finally:
+            shown, self._shown_contact_view = self._shown_contact_view, None
+            if shown is not None:
+                self._user32.ShowWindow(shown, _SW_HIDE)
 
     def _main_window(self) -> Optional[int]:
         for handle in self._all_top_level():
