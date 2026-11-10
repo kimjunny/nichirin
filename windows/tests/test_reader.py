@@ -323,6 +323,14 @@ class SearchPositionTests(unittest.TestCase):
         )
         self.assertIsNone(reader.search_position(target, rooms=self.rooms, listed="계정 이름"))
 
+    def test_an_open_chat_is_not_listed_by_the_chat_search(self) -> None:
+        # The client keeps open chats under their own tab, and its chat
+        # search leaves them out even when a member matches.
+        reader = self.reader()
+        self.rooms[0] = replace(self.rooms[0], type="OM")
+        self.assertEqual(reader.search_position(self.rooms[2].id, rooms=self.rooms), 1)
+        self.assertIsNone(reader.search_position(self.rooms[0].id, query="합성 이름", rooms=self.rooms))
+
     def test_given_the_rooms_it_reads_no_catalog(self) -> None:
         reader = self.reader()
         reader.rooms = lambda limit=None: self.fail("the catalog was read")  # type: ignore[method-assign]
