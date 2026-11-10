@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .errors import ErrorCode, KanaoError
-from .model import SELF_CHAT, Room
+from .model import DIRECT_CHAT, SELF_CHAT, Room
 from .reader import Reader
 
 
@@ -33,6 +33,23 @@ def search_rows(
         term: reader.search_position(room.id, query=term, rooms=rooms, listed=listed)
         for term in (room.title, *aliases)
     }
+
+
+def contact_name(reader: Reader, room: Room) -> Optional[str]:
+    """The friend whose row opens *room*, for a room that is one friend's 1:1.
+
+    A direct room is opened from that person's row in the friends list, which
+    the caller can search by name; a group has no such row and returns None.
+    The room's own title is not used: it is the friend's name for a 1:1 room,
+    but a group can carry a member's name, and a room the account renamed
+    carries the new name while the friend row keeps the person's.
+    """
+    if room.type != DIRECT_CHAT:
+        return None
+    for friend in reader.friends():
+        if friend.direct_chat_id == room.id:
+            return friend.name
+    return None
 
 
 def window_target(
@@ -81,6 +98,7 @@ def open_for_reading(reader: Reader, room: Room) -> None:
         hint=hint,
         search_rows=rows,
         self_chat=room.type == SELF_CHAT,
+        contact_name=contact_name(reader, room),
     )
     if not reader.unlock(room.id):
         raise KanaoError(

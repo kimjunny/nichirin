@@ -28,7 +28,7 @@ from .context import DEFAULT_LIMIT, read_context
 from .errors import ErrorCode, KanaoError, as_envelope, success
 from .model import ATTACHMENT_KINDS, SELF_CHAT, Room
 from .names import NameLedger
-from .opening import open_for_reading, window_target
+from .opening import contact_name, open_for_reading, window_target
 from .reader import Reader
 from .watch import DEFAULT_INTERVAL_SECONDS, Watcher
 import kakaocommon.trace as trace
@@ -633,6 +633,7 @@ def _send_result(reader: Reader, arguments: argparse.Namespace, text: str) -> di
     with trace.stage("catalog"):
         room = _selected_room(reader, arguments)
         aliases, hint, rows = window_target(reader, room)
+        friend = contact_name(reader, room)
         trace.identify("room", room.id)
     observation = (
         Confirmation(reader, room.id, text, arguments.confirm,
@@ -650,6 +651,7 @@ def _send_result(reader: Reader, arguments: argparse.Namespace, text: str) -> di
             hint=hint,
             search_rows=rows,
             self_chat=room.type == SELF_CHAT,
+            contact_name=friend,
             **confirmation,
         )
         logged = observation.check() if observation is not None and result["submitted"] else {}
@@ -687,6 +689,7 @@ def _sendfile(reader: Reader, arguments: argparse.Namespace) -> int:
     with trace.stage("catalog"):
         room = _selected_room(reader, arguments)
         aliases, hint, rows = window_target(reader, room)
+        friend = contact_name(reader, room)
         trace.identify("room", room.id)
     try:
         result = _gated(
@@ -698,6 +701,7 @@ def _sendfile(reader: Reader, arguments: argparse.Namespace) -> int:
                 hint=hint,
                 search_rows=rows,
                 self_chat=room.type == SELF_CHAT,
+                contact_name=friend,
             )
         )
     except OSError as error:

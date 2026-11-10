@@ -797,11 +797,21 @@ class Reader:
         *listed* is the title the client lists the room under when that is
         not the catalog's: the self-chat is 나와의 채팅 here and the account's
         name there, and only the second is something its search matches (#87).
+
+        Open chats are not counted. The client now keeps them under their own
+        오픈채팅 tab, and the chat tab's search leaves them out: '김정훈' listed
+        김정훈, 청량리, ai야 이거먹어 with no sign of the open chat that sits
+        between the last two by recency, measured live. An open chat itself
+        is therefore found nowhere by this search.
         """
+        from .model import OPEN_DIRECT_CHAT, OPEN_GROUP_CHAT
+
         if rooms is None:
             rooms = self.rooms()
+        open_types = (OPEN_DIRECT_CHAT, OPEN_GROUP_CHAT)
+        rooms = [room for room in rooms if room.id == room_id or room.type not in open_types]
         target = next((room for room in rooms if room.id == room_id), None)
-        if target is None:
+        if target is None or target.type in open_types:
             return None
         needle = (query if query is not None else target.title).casefold()
         if not needle:
